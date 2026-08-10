@@ -1,82 +1,11 @@
 # ==========================================================
-# Cell 18 : BATCH RUN -> DELTA
-#           Generates responses for the eval questions and checkpoints
-#           them. Evaluation reads this table later; nothing here
-#           scores anything.
-#
-#           Resumable: rerunning skips questions already answered, so
-#           an interruption at question 400 does not restart from zero.
-#           NOTE: that also means changing a prompt or MATCH_CUTOFF and
-#           rerunning gives you the OLD answers. Drop the table first:
-#               spark.sql(f"DROP TABLE IF EXISTS {RESPONSE_TABLE}")
+# Cell 18 : ASK
+#           Give it a question, it prints the response.
 # ==========================================================
-print("=" * 80)
-print("CELL 18 — BATCH RESPONSE GENERATION")
-print("=" * 80)
 
-N_QUESTIONS = 20     # raise once single-question output looks right
+QUESTION = "How do I open the OpenTCCM model using MTCCM?"
 
-questions = [r["request"] for r in
-             top50_eval.select("request").limit(N_QUESTIONS).collect()]
+r = kg_answer(QUESTION, verbose=False)
 
-try:
-    done = {r["question"] for r in
-            spark.table(RESPONSE_TABLE).select("question").distinct().collect()}
-    print(f"Already answered (skipped) : {len(done)}")
-except Exception:
-    done = set()
-    print(f"No checkpoint table yet -- starting fresh at {RESPONSE_TABLE}")
-
-todo = [q for q in questions if q not in done]
-print(f"Questions to answer        : {len(todo)}")
-
-rows = []
-for i, q in enumerate(todo, 1):
-    r = kg_answer(q, verbose=False)
-    rows.append({
-        "question": q,
-        "answer": r["answer"],
-        "n_seeds": len(r["seeds"]),
-        "n_edges": len(r["edges"]),
-        "n_docs": len(r["docs"]),
-        "fallback_used": r["fallback_used"],
-        "context_chars": len(r["context"]),
-        "seed_labels": " | ".join(l for _n, l, _s, _p in r["seeds"][:5]),
-        "doc_labels": " | ".join(d[1] for d in r["docs"]),
-        "top_triples": "\n".join(
-            f"{e['source_label']} --[{e['predicate']},{e['strength']}]--> {e['target_label']}"
-            for e in r["edges"][:5]),
-    })
-    if i % 5 == 0:
-        print(f"  ...{i}/{len(todo)}")
-
-if rows:
-    (spark.createDataFrame(rows).write
-     .mode("append").option("mergeSchema", "true").saveAsTable(RESPONSE_TABLE))
-    print(f"\nWrote {len(rows)} responses -> {RESPONSE_TABLE}")
-
-responses_df = spark.table(RESPONSE_TABLE)
-n = max(responses_df.count(), 1)
-
-# ---- Health counts -----------------------------------------------------
-# These tell you WHERE to spend effort:
-#   zero seeds -> entity linking is the bottleneck (lower MATCH_CUTOFF)
-#   zero edges -> graph sparsity, a Cell 8c problem not a retriever one
-#   fallback   -> EXTRACT_PROMPT is missing the right phrases
-print()
-print(f"Total responses stored : {n}")
-print(f"Zero seeds   : {responses_df.filter('n_seeds = 0').count()}/{n}")
-print(f"Zero edges   : {responses_df.filter('n_edges = 0').count()}/{n}")
-print(f"Used fallback: {responses_df.filter('fallback_used').count()}/{n}")
-
-# ---- Question / Response -----------------------------------------------
-print()
-print("=" * 80)
-print("RESPONSES")
-print("=" * 80)
-print()
-
-for r in responses_df.collect():
-    print("Question :-", r["question"])
-    print("Response :-", r["answer"])
-    print()
+print("Question :-", r["question"])
+print("Response :-", r["answer"])
