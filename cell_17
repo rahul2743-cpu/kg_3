@@ -4,6 +4,9 @@
 #   score = match quality x hop decay x relationship strength x degree
 #   Degree is the one place NetworkX is used -- a SPARQL COUNT would be
 #   one query per candidate node.
+#
+#   Definitions only. Nothing runs here -- ask a question in a new
+#   cell with:  kg_answer("your question")
 # ==========================================================
 print("=" * 80)
 print("CELL 17 — RANK, ASSEMBLE, ANSWER")
@@ -147,12 +150,9 @@ def kg_answer(question, verbose=True):
     return r
 
 
-# ---- Smoke test: first question from the eval set, not a fixed string --
-_smoke = top50_eval.select("request").first()
-if _smoke:
-    _r = kg_answer(_smoke["request"])
-    print("\n" + "-" * 80)
-    print(_r["answer"])
+print("Ready. Ask a question in a new cell:")
+print('    result = kg_answer("your question here")')
+print('    print(result["answer"])')
 
 
 result = kg_answer("your question here")
