@@ -69,7 +69,7 @@ print(f"Zero seeds   : {responses_df.filter('n_seeds = 0').count()}/{n}")
 print(f"Zero edges   : {responses_df.filter('n_edges = 0').count()}/{n}")
 print(f"Used fallback: {responses_df.filter('fallback_used').count()}/{n}")
 
-# ---- Question / Response, printed plainly ------------------------------
+# ---- Question / Response -----------------------------------------------
 print()
 print("=" * 80)
 print("RESPONSES")
