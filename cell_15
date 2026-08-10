@@ -1,0 +1,50 @@
+# ==========================================================
+# Cell 15 : QUERY -> ENTITY PHRASES
+#           The only LLM call before retrieval. Everything downstream
+#           is deterministic graph work.
+# ==========================================================
+print("=" * 80)
+print("CELL 15 — QUERY ENTITY EXTRACTION")
+print("=" * 80)
+
+EXTRACT_PROMPT = """You extract entity mentions from a question so they can be
+looked up in a systems-engineering knowledge graph.
+
+Return every noun phrase in the question that names a concrete thing:
+a system, component, parameter, method, standard, procedure, document,
+or failure mode. Use the exact phrase as it appears in the question.
+
+Do NOT return: question words, verbs, generic words like "process" or
+"information", or anything you invent that is not in the question.
+
+Output one record per entity, formatted exactly as:
+<entity phrase>|<one of: System, Component, ControlFactor, NoiseFactor, ErrorState, Method, Procedure, Standard, Concept>
+
+No preamble, no markdown, no numbering. Only the records.
+If the question names no concrete entity at all, output exactly: NONE"""
+
+
+def extract_query_entities(question: str):
+    """-> [(phrase, class_hint)]. Never raises; an LLM failure degrades
+    to [] and the caller falls back to lexical matching."""
+    try:
+        resp = driver_llm.invoke([
+            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "user", "content": question},
+        ])
+        text = resp.content.strip()
+    except Exception as e:
+        print(f"  entity extraction failed ({e}) -- lexical fallback")
+        return []
+
+    if text.upper().startswith("NONE"):
+        return []
+
+    out = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*0123456789. ").strip()
+        if line and "|" in line:
+            phrase, cls = line.split("|", 1)
+            if phrase.strip():
+                out.append((phrase.strip(), cls.strip()))
+    return out
