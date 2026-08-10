@@ -1,0 +1,587 @@
+# ##########################################################
+# KNOWLEDGE GRAPH RETRIEVER — FINAL
+# Cells 14-18. Paste after Cell 13 in RAg_KG_2.ipynb.
+#
+# Pure KG retrieval. No vector store, no BM25, no embeddings.
+# SPARQL against the RDF graph `g` is the retrieval engine.
+# NetworkX `G` is used only for degree during ranking.
+#
+#   Cell 14  Setup: label index, content check, matcher, LLM
+#   Cell 15  Query -> entity phrases          (LLM)
+#   Cell 16  Phrases -> seed nodes -> subgraph (SPARQL)
+#   Cell 17  Rank, assemble context, answer   (LLM)
+#   Cell 18  Batch run, checkpointed to Delta
+#
+# ---------------------------------------------------------
+# PREREQUISITE — fix Cell 12 before running any of this.
+# Its DOC_QUERY asks for `?doc a ex:Document`, but Cell 11 types
+# source pages as `ex:Asset`. SPARQL returns an empty result rather
+# than raising, so the failure is silent: no node in G gets a
+# `content` attribute and every answer is ungrounded.
+#
+#   In Cell 12's DOC_QUERY change:
+#       ?doc a ex:Document      ->      ?doc a ex:Asset
+#   Then rerun Cell 12.
+# ##########################################################
+
+
+# ==========================================================
+# Cell 14 : CONFIG + SETUP
+# ==========================================================
+import re
+import math
+from collections import defaultdict
+
+print("=" * 80)
+print("CELL 14 — RETRIEVER SETUP")
+print("=" * 80)
+
+# ---- All configuration lives here ------------------------------------
+KG_BASE = "http://knwbt.local/kg/"          # must match Cell 11's BASE
+SERVING_ENDPOINT = "https://adb-3955688708870984.4.azuredatabricks.net/serving-endpoints"
+RESPONSE_TABLE = "knwbt_airr_foundry_dev_catalog.secured.kg_retriever_responses"
+
+# retrieval
+MAX_HOPS = 2                 # 1 = direct facts only, 2 = adds sibling context
+HOP_DECAY = 0.45             # hop-2 evidence worth ~45% of hop-1
+MATCH_CUTOFF = 72            # fuzzy score floor, 0-100. Lower = more recall
+MAX_SEEDS_PER_PHRASE = 3
+MAX_FRONTIER = 60            # nodes carried into the next hop
+MAX_EDGES = 400              # hard stop before ranking
+
+# context
+MAX_TRIPLES = 40
+MAX_DOCS = 4
+MAX_DOC_CHARS = 2500
+MAX_CONTEXT_CHARS = 14000
+TRIPLE_BUDGET_FRAC = 0.55    # share of context reserved for relationships
+
+PREFIXES = f"""
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX ex:   <{KG_BASE}schema/>
+PREFIX cls:  <{KG_BASE}class/>
+"""
+PREDICATE_MARKER = f"{KG_BASE}predicate/"
+
+# ---- Step 1: label index ----------------------------------------------
+LABEL_QUERY = PREFIXES + """
+SELECT DISTINCT ?node ?label
+WHERE { ?node rdfs:label ?label . }
+"""
+
+NODE_LABEL = {}
+LABEL_TO_NODES = defaultdict(list)
+
+for row in g.query(LABEL_QUERY):
+    node, label = str(row.node), str(row.label).strip()
+    # Cell 11 labels predicates too. Excluded -- they are relationship
+    # types, not retrievable entities, and leaving them in lets a
+    # predicate like "depends on" seed as if it were a document.
+    if not label or node.startswith(PREDICATE_MARKER):
+        continue
+    NODE_LABEL[node] = label
+    LABEL_TO_NODES[label.lower()].append(node)
+
+ALL_LABELS = list(LABEL_TO_NODES.keys())
+print(f"Entity nodes indexed  : {len(NODE_LABEL)}")
+print(f"Distinct labels       : {len(ALL_LABELS)}")
+
+# ---- Step 2: which nodes carry document text --------------------------
+CONTENT_NODES = {
+    str(r.doc)
+    for r in g.query(PREFIXES + "SELECT ?doc WHERE { ?doc ex:documentContent ?c . }")
+}
+print(f"Nodes with content    : {len(CONTENT_NODES)}")
+
+# ---- Step 3: is the reification queryable -----------------------------
+_n_stmt = int(list(g.query(PREFIXES + """
+SELECT (COUNT(?s) AS ?n)
+WHERE { ?s a rdf:Statement ; ex:description ?d ; ex:strength ?w . }
+"""))[0].n)
+print(f"Reified statements    : {_n_stmt}")
+
+# ---- Gate: refuse to continue on a graph that cannot answer -----------
+_fatal = []
+if not ALL_LABELS:
+    _fatal.append("no rdfs:label in g -- rerun Cell 11")
+if not CONTENT_NODES:
+    _fatal.append("no ex:documentContent -- rerun Cell 11")
+if _n_stmt == 0:
+    _fatal.append("no reified statements -- traversal has nothing to walk")
+if _fatal:
+    print("\nSTOP:")
+    for f in _fatal:
+        print(f"  - {f}")
+else:
+    print("\nGraph is queryable.")
+
+# ---- Step 4: matcher --------------------------------------------------
+try:
+    from rapidfuzz import process as _rf_process, fuzz as _rf_fuzz
+
+    def fuzzy_match(query, choices, limit, cutoff):
+        return [(m, s) for m, s, _ in _rf_process.extract(
+            query, choices, scorer=_rf_fuzz.WRatio, limit=limit, score_cutoff=cutoff)]
+    print("Matcher : rapidfuzz")
+except ImportError:
+    import difflib
+
+    def fuzzy_match(query, choices, limit, cutoff):
+        hits = difflib.get_close_matches(query, choices, n=limit, cutoff=cutoff / 100.0)
+        return [(h, difflib.SequenceMatcher(None, query, h).ratio() * 100) for h in hits]
+    print("Matcher : difflib  (pip install rapidfuzz for better recall)")
+
+# ---- Step 5: LLM ------------------------------------------------------
+try:
+    driver_llm
+    print("LLM     : reusing driver_llm from Cell 10b")
+except NameError:
+    from langchain_openai import ChatOpenAI
+    driver_llm = ChatOpenAI(model=DEPLOYMENT_NAME, base_url=SERVING_ENDPOINT,
+                            api_key=DATABRICKS_TOKEN, temperature=0)
+    print("LLM     : built a new driver_llm")
+
+
+# ==========================================================
+# Cell 15 : QUERY -> ENTITY PHRASES
+#           The only LLM call before retrieval. Everything downstream
+#           is deterministic graph work.
+# ==========================================================
+print("=" * 80)
+print("CELL 15 — QUERY ENTITY EXTRACTION")
+print("=" * 80)
+
+EXTRACT_PROMPT = """You extract entity mentions from a question so they can be
+looked up in a systems-engineering knowledge graph.
+
+Return every noun phrase in the question that names a concrete thing:
+a system, component, parameter, method, standard, procedure, document,
+or failure mode. Use the exact phrase as it appears in the question.
+
+Do NOT return: question words, verbs, generic words like "process" or
+"information", or anything you invent that is not in the question.
+
+Output one record per entity, formatted exactly as:
+<entity phrase>|<one of: System, Component, ControlFactor, NoiseFactor, ErrorState, Method, Procedure, Standard, Concept>
+
+No preamble, no markdown, no numbering. Only the records.
+If the question names no concrete entity at all, output exactly: NONE"""
+
+
+def extract_query_entities(question: str):
+    """-> [(phrase, class_hint)]. Never raises; an LLM failure degrades
+    to [] and the caller falls back to lexical matching."""
+    try:
+        resp = driver_llm.invoke([
+            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "user", "content": question},
+        ])
+        text = resp.content.strip()
+    except Exception as e:
+        print(f"  entity extraction failed ({e}) -- lexical fallback")
+        return []
+
+    if text.upper().startswith("NONE"):
+        return []
+
+    out = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*0123456789. ").strip()
+        if line and "|" in line:
+            phrase, cls = line.split("|", 1)
+            if phrase.strip():
+                out.append((phrase.strip(), cls.strip()))
+    return out
+
+
+# ==========================================================
+# Cell 16 : LINKING + TRAVERSAL  (SPARQL, no LLM)
+#
+#   ITERATED, NOT A PROPERTY PATH: SPARQL property paths require fixed
+#   predicate IRIs -- variables are illegal inside a path -- and the
+#   {n,m} cardinality forms were removed from SPARQL 1.1 before it was
+#   finalised. With distinct predicates per relationship, the options
+#   are a chained-statement query or an iterated 1-hop query. Iterating
+#   wins: rdflib evaluates a chained double-statement pattern as a
+#   near-cartesian join, and each hop multiplies it again.
+#
+#   BOTH DIRECTIONS: Cell 10 only writes document -> entity edges, so
+#   following rdf:subject alone makes every component and parameter a
+#   dead end the moment a question asks about one.
+# ==========================================================
+print("=" * 80)
+print("CELL 16 — LINKING + TRAVERSAL")
+print("=" * 80)
+
+NEIGHBOUR_QUERY_TMPL = PREFIXES + """
+SELECT ?src ?srcLabel ?pred ?predLabel ?tgt ?tgtLabel
+       ?description ?strength ?linkType
+WHERE {
+    VALUES ?seed { %SEEDS% }
+    ?stmt a rdf:Statement ;
+          rdf:subject   ?src ;
+          rdf:predicate ?pred ;
+          rdf:object    ?tgt ;
+          ex:description ?description ;
+          ex:strength    ?strength ;
+          ex:linkType    ?linkType .
+    FILTER(?src = ?seed || ?tgt = ?seed)
+    OPTIONAL { ?src  rdfs:label ?srcLabel }
+    OPTIONAL { ?tgt  rdfs:label ?tgtLabel }
+    OPTIONAL { ?pred rdfs:label ?predLabel }
+}
+"""
+
+DOC_CONTENT_TMPL = PREFIXES + """
+SELECT ?doc ?label ?content
+WHERE {
+    VALUES ?doc { %DOCS% }
+    ?doc ex:documentContent ?content .
+    OPTIONAL { ?doc rdfs:label ?label }
+}
+"""
+
+SUBSTRING_TMPL = PREFIXES + """
+SELECT DISTINCT ?node ?label
+WHERE {
+    ?node rdfs:label ?label .
+    FILTER(CONTAINS(LCASE(STR(?label)), %PHRASE%))
+    FILTER(!STRSTARTS(STR(?node), "%PREDMARK%"))
+}
+LIMIT 10
+"""
+
+_STOP = {"the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "is",
+         "are", "what", "which", "how", "does", "do", "with", "by", "from"}
+
+
+def _tokens(s):
+    return {t for t in re.findall(r"[a-z0-9]+", (s or "").lower())
+            if t not in _STOP and len(t) > 2}
+
+
+def _values_block(uris):
+    return " ".join(f"<{u}>" for u in uris if "<" not in u and ">" not in u)
+
+
+def _sparql_literal(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def link_entities(phrases):
+    """Phrases -> [(node, label, score, phrase)]. Two passes: SPARQL
+    substring for precision, fuzzy for recall."""
+    best = {}
+    for phrase, _cls in phrases:
+        q = (SUBSTRING_TMPL
+             .replace("%PHRASE%", _sparql_literal(phrase.lower()))
+             .replace("%PREDMARK%", PREDICATE_MARKER))
+        try:
+            for row in g.query(q):
+                node = str(row.node)
+                if best.get(node, (0,))[0] < 95:
+                    best[node] = (95.0, phrase)
+        except Exception as e:
+            print(f"  substring query failed for {phrase!r}: {e}")
+
+        for label_lc, score in fuzzy_match(phrase.lower(), ALL_LABELS,
+                                           MAX_SEEDS_PER_PHRASE, MATCH_CUTOFF):
+            for node in LABEL_TO_NODES[label_lc]:
+                if node not in best or score > best[node][0]:
+                    best[node] = (score, phrase)
+
+    return [(n, NODE_LABEL.get(n, n), s, p)
+            for n, (s, p) in sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)]
+
+
+def lexical_fallback(question, limit=5):
+    """No LLM, no embeddings. Used when extraction returns nothing or
+    nothing links."""
+    q_tokens = _tokens(question)
+    if not q_tokens:
+        return []
+    scored = []
+    for label_lc, nodes in LABEL_TO_NODES.items():
+        overlap = q_tokens & _tokens(label_lc)
+        if overlap:
+            score = 100.0 * len(overlap) / max(len(_tokens(label_lc)), 1)
+            for n in nodes:
+                scored.append((n, NODE_LABEL.get(n, n), min(score, 99.0), "lexical"))
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return scored[:limit]
+
+
+def traverse(seeds):
+    """Iterated SPARQL expansion -- one query per hop, VALUES rebound to
+    that hop's frontier."""
+    edges, seen, visited = [], set(), {n: (0, s) for n, _l, s, _p in seeds}
+    frontier = [n for n, _l, _s, _p in seeds]
+
+    for hop in range(1, MAX_HOPS + 1):
+        if not frontier or len(edges) >= MAX_EDGES:
+            break
+        block = _values_block(frontier[:MAX_FRONTIER])
+        if not block:
+            break
+        try:
+            rows = list(g.query(NEIGHBOUR_QUERY_TMPL.replace("%SEEDS%", block)))
+        except Exception as e:
+            print(f"  hop {hop} query failed: {e}")
+            break
+
+        next_frontier = []
+        for row in rows:
+            src, tgt = str(row.src), str(row.tgt)
+            pred = str(row.predLabel) if row.predLabel else str(row.pred).rsplit("/", 1)[-1]
+            key = (src, pred, tgt)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            edges.append({
+                "source": src,
+                "source_label": str(row.srcLabel) if row.srcLabel else NODE_LABEL.get(src, src),
+                "predicate": pred,
+                "target": tgt,
+                "target_label": str(row.tgtLabel) if row.tgtLabel else NODE_LABEL.get(tgt, tgt),
+                "description": str(row.description),
+                "strength": int(row.strength),
+                "link_type": str(row.linkType),
+                "hop": hop,
+                "seed_score": max(visited.get(src, (0, 0))[1], visited.get(tgt, (0, 0))[1]),
+            })
+
+            for other in (src, tgt):
+                if other not in visited:
+                    visited[other] = (hop, edges[-1]["seed_score"])
+                    next_frontier.append(other)
+
+            if len(edges) >= MAX_EDGES:
+                break
+        frontier = next_frontier
+
+    return edges, visited
+
+
+# ==========================================================
+# Cell 17 : RANK, ASSEMBLE, ANSWER
+#
+#   score = match quality x hop decay x relationship strength x degree
+#   Degree is the one place NetworkX is used -- a SPARQL COUNT would be
+#   one query per candidate node.
+# ==========================================================
+print("=" * 80)
+print("CELL 17 — RANK, ASSEMBLE, ANSWER")
+print("=" * 80)
+
+ANSWER_PROMPT = """---Role---
+You answer questions using ONLY a knowledge graph extracted from an
+engineering wiki.
+
+---Context you are given---
+1. RELATIONSHIPS: lines of the form
+   Source --[predicate, strength]--> Target : explanation
+   Strength is 1-10, how explicit that relationship is in the source.
+2. DOCUMENTS: the full text of the most relevant source pages.
+
+---Rules---
+- Ground every claim in the context above. Do not use outside knowledge.
+- Prefer high-strength relationships and direct document text over weak,
+  distant ones.
+- Cite the document titles you used, in a "Sources:" line at the end.
+- If the context does not contain the answer, say so plainly and name
+  the closest thing it DOES contain. Do not guess.
+- Be concise. No preamble."""
+
+
+def _degree(node):
+    try:
+        return G.degree(node) if node in G else 0
+    except Exception:
+        return 0
+
+
+def rank_edges(edges):
+    for e in edges:
+        deg = _degree(e["source"]) + _degree(e["target"])
+        e["score"] = ((e["seed_score"] / 100.0)
+                      * (HOP_DECAY ** (e["hop"] - 1))
+                      * (e["strength"] / 10.0)
+                      * (1.0 + math.log1p(deg) / 12.0))
+    return sorted(edges, key=lambda x: x["score"], reverse=True)
+
+
+def pick_documents(ranked_edges):
+    doc_score = defaultdict(float)
+    for e in ranked_edges:
+        for side in ("source", "target"):
+            if e[side] in CONTENT_NODES:
+                doc_score[e[side]] += e["score"]
+    return [n for n, _ in sorted(doc_score.items(),
+                                 key=lambda kv: kv[1], reverse=True)[:MAX_DOCS]]
+
+
+def fetch_documents(doc_nodes):
+    """One SPARQL call for all chosen documents, not one per document."""
+    if not doc_nodes:
+        return []
+    block = _values_block(doc_nodes)
+    if not block:
+        return []
+    try:
+        rows = list(g.query(DOC_CONTENT_TMPL.replace("%DOCS%", block)))
+    except Exception as e:
+        print(f"  document fetch failed: {e}")
+        return []
+    order = {n: i for i, n in enumerate(doc_nodes)}
+    docs = [(str(r.doc),
+             str(r.label) if r.label else NODE_LABEL.get(str(r.doc), str(r.doc)),
+             str(r.content)) for r in rows]
+    docs.sort(key=lambda d: order.get(d[0], 999))
+    return docs
+
+
+def build_context(ranked_edges, docs):
+    lines, used = ["### RELATIONSHIPS"], 0
+    for e in ranked_edges[:MAX_TRIPLES]:
+        line = (f"{e['source_label']} --[{e['predicate']}, {e['strength']}]--> "
+                f"{e['target_label']} : {e['description']}")
+        if used + len(line) > MAX_CONTEXT_CHARS * TRIPLE_BUDGET_FRAC:
+            break
+        lines.append(line)
+        used += len(line)
+
+    lines.append("\n### DOCUMENTS")
+    for _uri, label, content in docs:
+        block = f"\n--- {label} ---\n{content[:MAX_DOC_CHARS]}"
+        if used + len(block) > MAX_CONTEXT_CHARS:
+            break
+        lines.append(block)
+        used += len(block)
+
+    return "\n".join(lines), used
+
+
+def kg_retrieve(question, verbose=True):
+    """Retrieval only, no generation -- so retrieval can be debugged
+    without spending LLM calls on answers."""
+    phrases = extract_query_entities(question)
+    seeds = link_entities(phrases) if phrases else []
+
+    fallback_used = False
+    if not seeds:
+        seeds, fallback_used = lexical_fallback(question), True
+
+    if not seeds:
+        return {"question": question, "phrases": phrases, "seeds": [], "edges": [],
+                "docs": [], "context": "", "fallback_used": fallback_used}
+
+    edges, _ = traverse(seeds)
+    ranked = rank_edges(edges)
+    docs = fetch_documents(pick_documents(ranked))
+    context, n_chars = build_context(ranked, docs)
+
+    if verbose:
+        print(f"\nQ : {question}")
+        print(f"  entities  : {[p for p, _ in phrases]}")
+        print(f"  seeds     : {[l for _, l, _, _ in seeds[:5]]}"
+              f"{'  (FALLBACK)' if fallback_used else ''}")
+        print(f"  edges     : {len(edges)} -> kept {min(len(ranked), MAX_TRIPLES)}")
+        print(f"  documents : {[d[1] for d in docs]}")
+        print(f"  context   : {n_chars} chars")
+
+    return {"question": question, "phrases": phrases, "seeds": seeds,
+            "edges": ranked, "docs": docs, "context": context,
+            "fallback_used": fallback_used}
+
+
+def kg_answer(question, verbose=True):
+    r = kg_retrieve(question, verbose=verbose)
+    if not r["context"]:
+        r["answer"] = ("No entity in this question matches any node in the "
+                       "knowledge graph, so there is nothing to ground an answer on.")
+        return r
+    try:
+        resp = driver_llm.invoke([
+            {"role": "system", "content": ANSWER_PROMPT},
+            {"role": "user", "content": f"{r['context']}\n\n---QUESTION---\n{question}"},
+        ])
+        r["answer"] = resp.content.strip()
+    except Exception as e:
+        r["answer"] = f"[generation failed: {e}]"
+    return r
+
+
+# ---- Smoke test: first question from the eval set, not a fixed string --
+_smoke = top50_eval.select("request").first()
+if _smoke:
+    _r = kg_answer(_smoke["request"])
+    print("\n" + "-" * 80)
+    print(_r["answer"])
+
+
+# ==========================================================
+# Cell 18 : BATCH RUN -> DELTA
+#           Generates responses for the eval questions and checkpoints
+#           them. Evaluation reads this table later; nothing here
+#           scores anything.
+#
+#           Resumable: rerunning skips questions already answered, so
+#           an interruption at question 400 does not restart from zero.
+# ==========================================================
+print("=" * 80)
+print("CELL 18 — BATCH RESPONSE GENERATION")
+print("=" * 80)
+
+N_QUESTIONS = 20     # raise once single-question output looks right
+
+questions = [r["request"] for r in
+             top50_eval.select("request").limit(N_QUESTIONS).collect()]
+
+try:
+    done = {r["question"] for r in
+            spark.table(RESPONSE_TABLE).select("question").distinct().collect()}
+    print(f"Already answered (skipped) : {len(done)}")
+except Exception:
+    done = set()
+    print(f"No checkpoint table yet -- starting fresh at {RESPONSE_TABLE}")
+
+todo = [q for q in questions if q not in done]
+print(f"Questions to answer        : {len(todo)}")
+
+rows = []
+for i, q in enumerate(todo, 1):
+    r = kg_answer(q, verbose=False)
+    rows.append({
+        "question": q,
+        "answer": r["answer"],
+        "n_seeds": len(r["seeds"]),
+        "n_edges": len(r["edges"]),
+        "n_docs": len(r["docs"]),
+        "fallback_used": r["fallback_used"],
+        "context_chars": len(r["context"]),
+        "seed_labels": " | ".join(l for _n, l, _s, _p in r["seeds"][:5]),
+        "doc_labels": " | ".join(d[1] for d in r["docs"]),
+        "top_triples": "\n".join(
+            f"{e['source_label']} --[{e['predicate']},{e['strength']}]--> {e['target_label']}"
+            for e in r["edges"][:5]),
+    })
+    if i % 5 == 0:
+        print(f"  ...{i}/{len(todo)}")
+
+if rows:
+    (spark.createDataFrame(rows).write
+     .mode("append").option("mergeSchema", "true").saveAsTable(RESPONSE_TABLE))
+    print(f"\nWrote {len(rows)} responses -> {RESPONSE_TABLE}")
+
+responses_df = spark.table(RESPONSE_TABLE)
+print(f"Total responses stored : {responses_df.count()}")
+
+n = max(responses_df.count(), 1)
+print(f"Zero seeds   : {responses_df.filter('n_seeds = 0').count()}/{n}")
+print(f"Zero edges   : {responses_df.filter('n_edges = 0').count()}/{n}")
+print(f"Used fallback: {responses_df.filter('fallback_used').count()}/{n}")
+print()
+display(responses_df.select("question", "answer", "seed_labels",
+                            "doc_labels", "n_edges", "fallback_used"))
