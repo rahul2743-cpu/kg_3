@@ -1,0 +1,159 @@
+# ==========================================================
+# Cell 17 : RANK, ASSEMBLE, ANSWER
+#
+#   score = match quality x hop decay x relationship strength x degree
+#   Degree is the one place NetworkX is used -- a SPARQL COUNT would be
+#   one query per candidate node.
+# ==========================================================
+print("=" * 80)
+print("CELL 17 — RANK, ASSEMBLE, ANSWER")
+print("=" * 80)
+
+ANSWER_PROMPT = """---Role---
+You answer questions using ONLY a knowledge graph extracted from an
+engineering wiki.
+
+---Context you are given---
+1. RELATIONSHIPS: lines of the form
+   Source --[predicate, strength]--> Target : explanation
+   Strength is 1-10, how explicit that relationship is in the source.
+2. DOCUMENTS: the full text of the most relevant source pages.
+
+---Rules---
+- Ground every claim in the context above. Do not use outside knowledge.
+- Prefer high-strength relationships and direct document text over weak,
+  distant ones.
+- Cite the document titles you used, in a "Sources:" line at the end.
+- If the context does not contain the answer, say so plainly and name
+  the closest thing it DOES contain. Do not guess.
+- Be concise. No preamble."""
+
+
+def _degree(node):
+    try:
+        return G.degree(node) if node in G else 0
+    except Exception:
+        return 0
+
+
+def rank_edges(edges):
+    for e in edges:
+        deg = _degree(e["source"]) + _degree(e["target"])
+        e["score"] = ((e["seed_score"] / 100.0)
+                      * (HOP_DECAY ** (e["hop"] - 1))
+                      * (e["strength"] / 10.0)
+                      * (1.0 + math.log1p(deg) / 12.0))
+    return sorted(edges, key=lambda x: x["score"], reverse=True)
+
+
+def pick_documents(ranked_edges):
+    doc_score = defaultdict(float)
+    for e in ranked_edges:
+        for side in ("source", "target"):
+            if e[side] in CONTENT_NODES:
+                doc_score[e[side]] += e["score"]
+    return [n for n, _ in sorted(doc_score.items(),
+                                 key=lambda kv: kv[1], reverse=True)[:MAX_DOCS]]
+
+
+def fetch_documents(doc_nodes):
+    """One SPARQL call for all chosen documents, not one per document."""
+    if not doc_nodes:
+        return []
+    block = _values_block(doc_nodes)
+    if not block:
+        return []
+    try:
+        rows = list(g.query(DOC_CONTENT_TMPL.replace("%DOCS%", block)))
+    except Exception as e:
+        print(f"  document fetch failed: {e}")
+        return []
+    order = {n: i for i, n in enumerate(doc_nodes)}
+    docs = [(str(r.doc),
+             str(r.label) if r.label else NODE_LABEL.get(str(r.doc), str(r.doc)),
+             str(r.content)) for r in rows]
+    docs.sort(key=lambda d: order.get(d[0], 999))
+    return docs
+
+
+def build_context(ranked_edges, docs):
+    lines, used = ["### RELATIONSHIPS"], 0
+    for e in ranked_edges[:MAX_TRIPLES]:
+        line = (f"{e['source_label']} --[{e['predicate']}, {e['strength']}]--> "
+                f"{e['target_label']} : {e['description']}")
+        if used + len(line) > MAX_CONTEXT_CHARS * TRIPLE_BUDGET_FRAC:
+            break
+        lines.append(line)
+        used += len(line)
+
+    lines.append("\n### DOCUMENTS")
+    for _uri, label, content in docs:
+        block = f"\n--- {label} ---\n{content[:MAX_DOC_CHARS]}"
+        if used + len(block) > MAX_CONTEXT_CHARS:
+            break
+        lines.append(block)
+        used += len(block)
+
+    return "\n".join(lines), used
+
+
+def kg_retrieve(question, verbose=True):
+    """Retrieval only, no generation -- so retrieval can be debugged
+    without spending LLM calls on answers."""
+    phrases = extract_query_entities(question)
+    seeds = link_entities(phrases) if phrases else []
+
+    fallback_used = False
+    if not seeds:
+        seeds, fallback_used = lexical_fallback(question), True
+
+    if not seeds:
+        return {"question": question, "phrases": phrases, "seeds": [], "edges": [],
+                "docs": [], "context": "", "fallback_used": fallback_used}
+
+    edges, _ = traverse(seeds)
+    ranked = rank_edges(edges)
+    docs = fetch_documents(pick_documents(ranked))
+    context, n_chars = build_context(ranked, docs)
+
+    if verbose:
+        print(f"\nQ : {question}")
+        print(f"  entities  : {[p for p, _ in phrases]}")
+        print(f"  seeds     : {[l for _, l, _, _ in seeds[:5]]}"
+              f"{'  (FALLBACK)' if fallback_used else ''}")
+        print(f"  edges     : {len(edges)} -> kept {min(len(ranked), MAX_TRIPLES)}")
+        print(f"  documents : {[d[1] for d in docs]}")
+        print(f"  context   : {n_chars} chars")
+
+    return {"question": question, "phrases": phrases, "seeds": seeds,
+            "edges": ranked, "docs": docs, "context": context,
+            "fallback_used": fallback_used}
+
+
+def kg_answer(question, verbose=True):
+    r = kg_retrieve(question, verbose=verbose)
+    if not r["context"]:
+        r["answer"] = ("No entity in this question matches any node in the "
+                       "knowledge graph, so there is nothing to ground an answer on.")
+        return r
+    try:
+        resp = driver_llm.invoke([
+            {"role": "system", "content": ANSWER_PROMPT},
+            {"role": "user", "content": f"{r['context']}\n\n---QUESTION---\n{question}"},
+        ])
+        r["answer"] = resp.content.strip()
+    except Exception as e:
+        r["answer"] = f"[generation failed: {e}]"
+    return r
+
+
+# ---- Smoke test: first question from the eval set, not a fixed string --
+_smoke = top50_eval.select("request").first()
+if _smoke:
+    _r = kg_answer(_smoke["request"])
+    print("\n" + "-" * 80)
+    print(_r["answer"])
+
+
+result = kg_answer("your question here")
+print(result["answer"])
