@@ -165,3 +165,15 @@ def traverse(seeds):
         frontier = next_frontier
 
     return edges, visited
+
+
+q = "What are the blocking rules for endurance testing?"
+seeds = link_entities(extract_query_entities(q))
+for uri, label, score, phrase in seeds[:5]:
+    print(f"{score:5.1f}  {label}   <- matched '{phrase}'")
+
+edges, visited = traverse(seeds)
+print(f"\n{len(edges)} edges from {len(seeds)} seeds")
+for e in edges[:5]:
+    print(f"  hop{e['hop']} [{e['strength']}] {e['source_label']} "
+          f"--{e['predicate']}--> {e['target_label']}")
