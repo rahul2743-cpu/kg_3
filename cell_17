@@ -151,8 +151,8 @@ def kg_answer(question, verbose=True):
 
 
 print("Ready. Ask a question in a new cell:")
-print('    result = kg_answer("your question here")')
-print('    print(result["answer"])')
+print('    r = kg_answer("your question here")')
+print('    print(r["answer"])')
 
 
 result = kg_answer("your question here")
